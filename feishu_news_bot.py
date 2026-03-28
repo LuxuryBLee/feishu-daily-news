@@ -11,12 +11,18 @@ from datetime import datetime
 import concurrent.futures
 from openai import OpenAI
 
-# 从环境变量读取配置（在 GitHub Actions 中通过 Secrets 注入）
+# 从环境变量读取配置
 WEBHOOK_URL = os.environ.get(
     "FEISHU_WEBHOOK",
     "https://open.feishu.cn/open-apis/bot/v2/hook/26d07ddf-5139-444e-9ede-0fcc734a904f"
 )
-client = OpenAI()  # 自动读取 OPENAI_API_KEY 环境变量
+
+# 必须指定 base_url，因为 GitHub Actions 默认会请求 api.openai.com，而我们使用的是 Manus 提供的代理 Key
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    base_url="https://api.manus.im/api/llm-proxy/v1",
+    timeout=30.0
+)
 
 RSS_SOURCES = {
     "🤖 AI与计算机": [
@@ -45,7 +51,7 @@ def clean_html(text):
 def fetch_rss_sync(url, limit=3):
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept-Encoding": "gzip, deflate",
         }
         resp = requests.get(url, headers=headers, timeout=15)
@@ -55,7 +61,7 @@ def fetch_rss_sync(url, limit=3):
         for entry in feed.entries[:limit]:
             title = clean_html(entry.get('title', '')).strip()
             link = entry.get('link', '')
-            summary = clean_html(entry.get('summary', entry.get('description', '')))[:600]
+            summary = clean_html(entry.get('summary', entry.get('description', '')))[:800]
             if title and len(title) > 5:
                 items.append({"title": title, "link": link, "summary": summary})
         return items
@@ -75,15 +81,17 @@ def fetch_category_news(category, sources):
         if key not in seen:
             seen.add(key)
             unique.append(item)
-    return unique[:4]
+    return unique[:3]  # 每个板块取前3条最有价值的新闻
 
 def generate_ai_analysis(news_list, category):
     if not news_list:
         return f"> 今日{category}暂无新消息，明天继续关注！"
+    
     news_text = "".join(
         f"[{i+1}] 标题: {item['title']}\n摘要: {item['summary']}\n链接: {item['link']}\n\n"
         for i, item in enumerate(news_list)
     )
+    
     prompt = f"""你是一位资深的{category}专家和科普作家，同时也是大学生的学习导师。
 
 以下是今日{category}领域的最新新闻/论文：
@@ -94,32 +102,39 @@ def generate_ai_analysis(news_list, category):
 
 **格式要求（严格遵守）：**
 
-从上述新闻中挑选 **1-2条最有价值的** 进行详细解读，每条按以下结构输出：
+请对提供的**每一条**新闻都进行详细解读（最多解读3条），每条按以下结构输出（不要省略任何一条的解读）：
 
-📌 **[新闻标题](链接)**
+📌 **[{'{新闻标题}'}]({'{链接}'})**
 
 💡 **核心解读**
-（2-3句话说明核心内容和重要性，语言简洁有力）
+（2-3句话说明这篇新闻/论文的核心贡献、创新点和重要性，语言专业但易懂）
 
-🧠 **知识补充**
-（通俗解释其中的专业概念，用类比或例子帮助理解，100字以内）
+🧠 **基础知识补充**
+（通俗解释其中的1-2个核心专业概念、算法或数学原理，用类比或例子帮助大学生理解，100-150字）
 
-如有其他新闻，最后用"**其他动态：**"一行带过（一句话一条）。
+**注意：**
+1. 必须使用中文回答。
+2. 绝对不捏造事实，只基于提供的摘要进行合理解读。
+3. 排版整洁，层级分明，利用 Markdown 加粗关键字。"""
 
-**注意：语言活泼，排版整洁，绝对不捏造事实，只基于提供的摘要进行合理解读。**"""
     try:
+        print(f"  正在调用 AI 解读 {category} 的 {len(news_list)} 条新闻...")
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
-                {"role": "system", "content": "你是一个专业的科技前沿解读助手。"},
+                {"role": "system", "content": "你是一个专业的科技前沿解读助手，擅长将复杂的学术论文和科技新闻转化为大学生易懂的知识。"},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=900
+            max_tokens=1500,
+            temperature=0.7
         )
         return response.choices[0].message.content
     except Exception as e:
         print(f"AI解析失败 ({category}): {e}")
-        return "\n".join(f"📌 **[{item['title']}]({item['link']})**\n" for item in news_list[:2])
+        # 如果失败，返回带有错误提示的原始链接，而不是悄悄吞掉错误
+        fallback = f"⚠️ AI 解读生成失败，以下是原始新闻链接：\n\n"
+        fallback += "\n".join(f"📌 **[{item['title']}]({item['link']})**\n> {item['summary'][:100]}...\n" for item in news_list)
+        return fallback
 
 def build_and_send():
     today_str = datetime.now().strftime("%Y年%m月%d日")
@@ -130,7 +145,7 @@ def build_and_send():
     for category, sources in RSS_SOURCES.items():
         print(f"📡 抓取 {category}...")
         news_list = fetch_category_news(category, sources)
-        print(f"  获取到 {len(news_list)} 条，正在AI解读...")
+        print(f"  获取到 {len(news_list)} 条去重新闻")
         ai_content = generate_ai_analysis(news_list, category)
         main_content += f"## {category}\n\n{ai_content}\n\n---\n\n"
 
@@ -145,18 +160,19 @@ def build_and_send():
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": "**Timmy，早上好！** ☀️\n\n今日为你精选 **AI、计算机、数学、科研** 领域最新动态，配有深度解读与知识补充，助你跟上时代前沿！\n\n---"
+                    "content": "**Timmy，早上好！** ☀️\n\n今日为你精选 **AI、计算机、数学、科研** 领域最新动态，配有深度解读与基础知识补充，助你跟上时代前沿！\n\n---"
                 },
                 {"tag": "markdown", "content": main_content},
                 {"tag": "hr"},
                 {
                     "tag": "note",
-                    "elements": [{"tag": "plain_text", "content": "✨ 由 GitHub Actions + Manus AI 自动抓取 arXiv · Nature · MIT News · Hacker News | 每日 07:00 准时推送"}]
+                    "elements": [{"tag": "plain_text", "content": "✨ 由 GitHub Actions + Manus AI 自动抓取并生成深度解读 | 每日 07:00 准时推送"}]
                 }
             ]
         }
     }
 
+    print("🚀 正在发送到飞书...")
     resp = requests.post(WEBHOOK_URL, json=card, timeout=15)
     resp.raise_for_status()
     result = resp.json()
