@@ -17,11 +17,11 @@ WEBHOOK_URL = os.environ.get(
     "https://open.feishu.cn/open-apis/bot/v2/hook/26d07ddf-5139-444e-9ede-0fcc734a904f"
 )
 
-# 必须指定 base_url，因为 GitHub Actions 默认会请求 api.openai.com，而我们使用的是 Manus 提供的代理 Key
+# 使用中转站 API，支持 gpt-5.4 等模型
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url="https://api.manus.im/api/llm-proxy/v1",
-    timeout=30.0
+    base_url="https://ai.qaq.al/v1",
+    timeout=60.0
 )
 
 RSS_SOURCES = {
@@ -120,7 +120,7 @@ def generate_ai_analysis(news_list, category):
     try:
         print(f"  正在调用 AI 解读 {category} 的 {len(news_list)} 条新闻...")
         response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-5.4",
             messages=[
                 {"role": "system", "content": "你是一个专业的科技前沿解读助手，擅长将复杂的学术论文和科技新闻转化为大学生易懂的知识。"},
                 {"role": "user", "content": prompt}
