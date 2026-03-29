@@ -133,14 +133,15 @@ def fetch_semantic_scholar(query, fields="title,abstract,url,year,publicationDat
             if not title or not url:
                 continue
             
-            # 时间过滤
-            if pub_date:
-                try:
-                    dt = datetime.fromisoformat(pub_date).replace(tzinfo=timezone.utc)
-                    if dt < cutoff:
-                        continue
-                except:
-                    pass
+            # 时间过滤（严格）
+            if not pub_date:
+                continue
+            try:
+                dt = datetime.fromisoformat(pub_date).replace(tzinfo=timezone.utc)
+                if dt < cutoff:
+                    continue
+            except:
+                continue
             
             if not is_technical_content(title, abstract):
                 continue
@@ -177,13 +178,14 @@ def fetch_papers_with_code(limit=20):
             
             if not title:
                 continue
-            if pub_date:
-                try:
-                    dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                    if dt < cutoff:
-                        continue
-                except:
-                    pass
+            if not pub_date:
+                continue
+            try:
+                dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+                if dt < cutoff:
+                    continue
+            except:
+                continue
             if not is_technical_content(title, abstract):
                 continue
             
@@ -220,12 +222,14 @@ def fetch_arxiv_api(categories, max_results=50):
             link = entry.get('link', '')
             summary = clean_html(entry.get('summary', ''))[:600]
             pub = entry.get('published', '')
+            if not pub:
+                continue
             try:
                 dt = datetime.fromisoformat(pub.replace('Z', '+00:00'))
                 if dt < cutoff:
                     continue
             except:
-                pass
+                continue
             if not title or not is_technical_content(title, summary):
                 continue
             items.append({
