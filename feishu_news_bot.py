@@ -1,178 +1,377 @@
 """
 每日科技与科研前沿速递 - 飞书推送机器人
 适用于 GitHub Actions 定时触发，完全免费、永久独立运行
+
+数据源策略：
+  - arXiv API（非RSS）：支持按提交日期排序，周末也有数据
+  - Nature / Science / Phys.org RSS：自然科学板块
+  - Hacker News API：计算机工程实践
+
+板块：
+  🤖 AI 与深度学习（至少3条）
+  💻 计算机科学与系统（至少3条）
+  📐 数学与理论（至少3条）
+  🔬 自然科学（1-3条）
+
+筛选原则：
+  - 纯技术/理论：论文发表、算法突破、理论证明、工程创新
+  - 过滤政治、人文、商业、娱乐等非技术内容
+  - 时间窗口：3天内
 """
 
 import os
 import re
+import time
 import requests
 import feedparser
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 import concurrent.futures
 from openai import OpenAI
 
-# 从环境变量读取配置
+# ── 配置 ──────────────────────────────────────────────────────────────
 WEBHOOK_URL = os.environ.get(
     "FEISHU_WEBHOOK",
     "https://open.feishu.cn/open-apis/bot/v2/hook/26d07ddf-5139-444e-9ede-0fcc734a904f"
 )
 
-# 使用中转站 API，支持 gpt-5.4 等模型
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
     base_url="https://ai.qaq.al/v1",
-    timeout=60.0
+    timeout=90.0
 )
 
-RSS_SOURCES = {
-    "🤖 AI与计算机": [
-        {"url": "http://export.arxiv.org/rss/cs.AI",  "name": "arXiv · AI"},
-        {"url": "http://export.arxiv.org/rss/cs.LG",  "name": "arXiv · 机器学习"},
-        {"url": "http://export.arxiv.org/rss/cs.CV",  "name": "arXiv · 计算机视觉"},
-        {"url": "https://hnrss.org/frontpage",         "name": "Hacker News"},
+TIME_WINDOW_DAYS = 3
+
+# ── arXiv 分类配置 ─────────────────────────────────────────────────────
+ARXIV_CATEGORIES = {
+    "🤖 AI与深度学习": [
+        "cs.AI", "cs.LG", "cs.CV", "cs.CL", "cs.NE", "stat.ML"
     ],
-    "📐 数学": [
-        {"url": "http://export.arxiv.org/rss/math.NA", "name": "arXiv · 数值分析"},
-        {"url": "http://export.arxiv.org/rss/math.OC", "name": "arXiv · 优化与控制"},
-        {"url": "http://export.arxiv.org/rss/math.ST", "name": "arXiv · 统计理论"},
+    "💻 计算机科学与系统": [
+        "cs.DS", "cs.CR", "cs.PL", "cs.DC", "cs.AR", "cs.SE", "cs.IT"
     ],
-    "🔬 科研与科学": [
-        {"url": "https://www.nature.com/nature.rss",                "name": "Nature"},
-        {"url": "https://news.mit.edu/rss/research",                "name": "MIT News"},
-        {"url": "https://www.sciencedaily.com/rss/top/science.xml", "name": "Science Daily"},
-        {"url": "https://phys.org/rss-feed/",                       "name": "Phys.org"},
-    ]
+    "📐 数学与理论": [
+        "math.NA", "math.OC", "math.ST", "math.CO", "math.PR", "math.NT",
+        "math.AG", "math.AP", "cs.CC"
+    ],
 }
+
+# 自然科学用 RSS（Nature/Science/Phys.org 不提供 API）
+NATURE_SCIENCE_RSS = [
+    {"url": "https://www.nature.com/nature.rss",            "name": "Nature"},
+    {"url": "https://www.science.org/rss/news_current.xml", "name": "Science"},
+    {"url": "https://phys.org/rss-feed/",                   "name": "Phys.org"},
+    {"url": "http://export.arxiv.org/rss/quant-ph",         "name": "arXiv · 量子物理"},
+    {"url": "http://export.arxiv.org/rss/physics.comp-ph",  "name": "arXiv · 计算物理"},
+]
+
+# 板块条数限制
+CATEGORY_LIMITS = {
+    "🤖 AI与深度学习":     {"min": 3, "max": 5},
+    "💻 计算机科学与系统": {"min": 3, "max": 5},
+    "📐 数学与理论":        {"min": 3, "max": 5},
+    "🔬 自然科学":          {"min": 1, "max": 3},
+}
+
+# ── 内容过滤 ───────────────────────────────────────────────────────────
+BLOCK_KEYWORDS = [
+    "election", "president", "congress", "senate", "democrat", "republican",
+    "trump", "biden", "ukraine", "russia", "china policy", "geopolit",
+    "政治", "选举", "政府", "议会", "制裁", "外交", "战争", "军事",
+    "stock", "ipo", "funding", "valuation", "revenue", "profit", "acquisition",
+    "融资", "上市", "股价", "市值", "收购", "营收",
+    "celebrity", "movie", "music", "entertainment", "sports", "fashion",
+    "娱乐", "明星", "电影", "音乐", "体育",
+    "lawsuit", "court", "crime", "arrest", "scandal",
+    "诉讼", "犯罪", "丑闻",
+]
+
+TECH_KEYWORDS = [
+    "algorithm", "model", "neural", "learning", "theorem", "proof",
+    "optimization", "complexity", "architecture", "framework", "benchmark",
+    "dataset", "training", "inference", "convergence", "gradient",
+    "transformer", "diffusion", "quantum", "cryptography", "graph",
+    "matrix", "tensor", "probability", "statistics", "topology",
+    "论文", "算法", "模型", "神经网络", "定理", "证明", "优化",
+    "复杂度", "架构", "基准", "训练", "推理", "收敛", "梯度",
+    "量子", "密码", "图论", "数论", "概率", "统计",
+]
 
 def clean_html(text):
     text = re.sub(r'<[^>]+>', '', text)
     return re.sub(r'\s+', ' ', text).strip()
 
-def fetch_rss_sync(url, limit=3):
+def is_technical_content(title, summary=""):
+    text = (title + " " + summary).lower()
+    for kw in BLOCK_KEYWORDS:
+        if kw.lower() in text:
+            return False
+    return True
+
+def tech_score(title, summary=""):
+    text = (title + " " + summary).lower()
+    return sum(1 for kw in TECH_KEYWORDS if kw.lower() in text)
+
+# ── arXiv API 抓取 ─────────────────────────────────────────────────────
+def fetch_arxiv_group(categories, total_max=5):
+    """
+    通过 arXiv API 单次合并查询多个分类，避免并发限速。
+    使用 OR 连接多个分类，一次请求获取所有结果。
+    """
+    # 构建合并查询：cat:cs.AI OR cat:cs.LG OR ...
+    cat_query = " OR ".join(f"cat:{c}" for c in categories)
+    max_results = min(total_max * 6, 50)  # 多抓一些用于过滤
+    url = (
+        f"http://export.arxiv.org/api/query"
+        f"?search_query={requests.utils.quote(cat_query)}"
+        f"&sortBy=submittedDate&sortOrder=descending"
+        f"&max_results={max_results}"
+    )
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept-Encoding": "gzip, deflate",
-        }
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.text)
+        all_items = []
+        cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
+        for entry in feed.entries:
+            title = clean_html(entry.get('title', '')).replace('\n', ' ').strip()
+            link = entry.get('link', '')
+            summary = clean_html(entry.get('summary', ''))[:600]
+            # 时间过滤
+            pub = entry.get('published', '')
+            try:
+                dt = datetime.fromisoformat(pub.replace('Z', '+00:00'))
+                if dt < cutoff:
+                    continue
+            except Exception:
+                pass
+            if not title or len(title) < 5:
+                continue
+            if not is_technical_content(title, summary):
+                continue
+            all_items.append({
+                "title": title,
+                "link": link,
+                "summary": summary,
+                "score": tech_score(title, summary)
+            })
+
+        # 去重
+        seen, unique = set(), []
+        for item in all_items:
+            key = item["title"][:60].lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+
+        unique.sort(key=lambda x: x["score"], reverse=True)
+        result = unique[:total_max]
+        print(f"  共抓取 {len(feed.entries)} 条 → 过滤后 {len(all_items)} 条 → 去重 {len(unique)} 条 → 取前 {len(result)} 条")
+        return result
+    except Exception as e:
+        print(f"  ⚠️ arXiv API 失败: {e}")
+        return []
+
+# ── RSS 抓取（自然科学板块） ───────────────────────────────────────────
+def fetch_rss_sync(url, limit=8):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}
+        resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
         feed = feedparser.parse(resp.text)
         items = []
+        cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
         for entry in feed.entries[:limit]:
             title = clean_html(entry.get('title', '')).strip()
             link = entry.get('link', '')
-            summary = clean_html(entry.get('summary', entry.get('description', '')))[:800]
-            if title and len(title) > 5:
-                items.append({"title": title, "link": link, "summary": summary})
+            summary = clean_html(entry.get('summary', entry.get('description', '')))[:600]
+            # 时间过滤
+            for field in ('published', 'updated'):
+                raw = entry.get(field, '')
+                if raw:
+                    try:
+                        dt = parsedate_to_datetime(raw)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff:
+                            title = ''  # 标记为过期
+                        break
+                    except Exception:
+                        continue
+            if not title or len(title) < 5:
+                continue
+            if not is_technical_content(title, summary):
+                continue
+            items.append({
+                "title": title,
+                "link": link,
+                "summary": summary,
+                "score": tech_score(title, summary)
+            })
         return items
     except Exception as e:
-        print(f"⚠️ 抓取失败 [{url}]: {e}")
+        print(f"  ⚠️ RSS 失败 [{url}]: {e}")
         return []
 
-def fetch_category_news(category, sources):
+def fetch_nature_science_news(max_count=3):
+    """抓取自然科学板块"""
     all_items = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch_rss_sync, src["url"], 2): src for src in sources}
+        futures = [executor.submit(fetch_rss_sync, src["url"]) for src in NATURE_SCIENCE_RSS]
         for future in concurrent.futures.as_completed(futures):
             all_items.extend(future.result())
+
     seen, unique = set(), []
     for item in all_items:
-        key = item["title"][:50]
+        key = item["title"][:60].lower()
         if key not in seen:
             seen.add(key)
             unique.append(item)
-    return unique[:3]  # 每个板块取前3条最有价值的新闻
 
+    unique.sort(key=lambda x: x["score"], reverse=True)
+    result = unique[:max_count]
+    print(f"  共抓取 {len(all_items)} 条 → 去重后 {len(unique)} 条 → 取前 {len(result)} 条")
+    return result
+
+# ── AI 解读 ────────────────────────────────────────────────────────────
 def generate_ai_analysis(news_list, category):
     if not news_list:
-        return f"> 今日{category}暂无新消息，明天继续关注！"
-    
+        return (
+            f"> ⚠️ 今日{category}暂无符合条件的技术资讯\n"
+            f"> （时间窗口：近3天，已过滤非技术内容）\n"
+            f"> 明日继续关注！"
+        )
+
     news_text = "".join(
-        f"[{i+1}] 标题: {item['title']}\n摘要: {item['summary']}\n链接: {item['link']}\n\n"
+        f"[{i+1}] 标题: {item['title']}\n"
+        f"摘要: {item['summary']}\n"
+        f"链接: {item['link']}\n\n"
         for i, item in enumerate(news_list)
     )
-    
-    prompt = f"""你是一位资深的{category}专家和科普作家，同时也是大学生的学习导师。
 
-以下是今日{category}领域的最新新闻/论文：
+    prompt = f"""你是一位资深的{category}专家和科普导师，读者是**信息与计算科学专业大学生**（对AI、深度学习、数学建模感兴趣，预计2027年毕业）。
+
+以下是{category}领域近3天内的最新论文/技术资讯（均为纯技术/理论内容，已过滤政治、商业、人文内容）：
 
 {news_text}
 
-请为一位**信息与计算科学专业的大学生**（对AI、深度学习、数学建模感兴趣，预计2027年毕业）撰写一份精彩的早报解读。
+请对**每一条**内容进行详细解读，严格按以下格式输出，不得省略任何一条：
 
-**格式要求（严格遵守）：**
+---
 
-请对提供的**每一条**新闻都进行详细解读（最多解读3条），每条按以下结构输出（不要省略任何一条的解读）：
+📌 **[完整标题](链接)**
 
-📌 **[{'{新闻标题}'}]({'{链接}'})**
+💡 **核心贡献**
+（2-3句话：该论文/技术的核心创新点、解决了什么问题、有何突破性意义）
 
-💡 **核心解读**
-（2-3句话说明这篇新闻/论文的核心贡献、创新点和重要性，语言专业但易懂）
+🧠 **知识补充**
+（通俗解释其中1-2个核心专业概念或数学原理，用类比或具体例子帮助大学生理解，100-150字）
 
-🧠 **基础知识补充**
-（通俗解释其中的1-2个核心专业概念、算法或数学原理，用类比或例子帮助大学生理解，100-150字）
+📊 **与你的关联**
+（一句话：与信息与计算科学/AI/数学建模的关联，或对未来学习/研究的启发）
 
-**注意：**
-1. 必须使用中文回答。
-2. 绝对不捏造事实，只基于提供的摘要进行合理解读。
-3. 排版整洁，层级分明，利用 Markdown 加粗关键字。"""
+---
+
+**严格要求：**
+1. 全程使用中文，英文术语保留原文并加粗。
+2. 只基于提供的摘要进行合理推断，不捏造数据或结论。
+3. 重点突出**技术细节**和**数学原理**，不涉及任何政治、商业评论。
+4. 排版整洁，Markdown 加粗关键术语。"""
 
     try:
-        print(f"  正在调用 AI 解读 {category} 的 {len(news_list)} 条新闻...")
+        print(f"  🤖 AI 解读 {category}（{len(news_list)} 条）...")
         response = client.chat.completions.create(
             model="gpt-5.4",
             messages=[
-                {"role": "system", "content": "你是一个专业的科技前沿解读助手，擅长将复杂的学术论文和科技新闻转化为大学生易懂的知识。"},
+                {
+                    "role": "system",
+                    "content": (
+                        "你是专业的技术前沿解读助手，专注于AI、计算机科学、数学领域的学术论文和技术突破解读，"
+                        "只讨论纯技术和理论内容，不涉及政治、商业、人文话题。"
+                    )
+                },
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1500,
-            temperature=0.7
+            max_tokens=2800,
+            temperature=0.6
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"AI解析失败 ({category}): {e}")
-        # 如果失败，返回带有错误提示的原始链接，而不是悄悄吞掉错误
-        fallback = f"⚠️ AI 解读生成失败，以下是原始新闻链接：\n\n"
-        fallback += "\n".join(f"📌 **[{item['title']}]({item['link']})**\n> {item['summary'][:100]}...\n" for item in news_list)
+        print(f"  ❌ AI解析失败 ({category}): {e}")
+        fallback = f"⚠️ AI 解读生成失败（{e}），原始资讯如下：\n\n"
+        fallback += "\n\n".join(
+            f"📌 **[{item['title']}]({item['link']})**\n> {item['summary'][:200]}..."
+            for item in news_list
+        )
         return fallback
 
+# ── 构建并发送飞书消息 ─────────────────────────────────────────────────
 def build_and_send():
-    today_str = datetime.now().strftime("%Y年%m月%d日")
+    now_utc8 = datetime.now(timezone.utc) + timedelta(hours=8)
+    today_str = now_utc8.strftime("%Y年%m月%d日")
     weekday_map = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    weekday = weekday_map[datetime.now().weekday()]
+    weekday = weekday_map[now_utc8.weekday()]
 
     main_content = ""
-    for category, sources in RSS_SOURCES.items():
-        print(f"📡 抓取 {category}...")
-        news_list = fetch_category_news(category, sources)
-        print(f"  获取到 {len(news_list)} 条去重新闻")
+    total_news = 0
+
+    # 三大重点板块：使用 arXiv API
+    for category, cats in ARXIV_CATEGORIES.items():
+        limits = CATEGORY_LIMITS[category]
+        print(f"\n📡 抓取 {category}（目标 {limits['min']}-{limits['max']} 条，分类：{cats}）...")
+        news_list = fetch_arxiv_group(cats, total_max=limits["max"])
+        total_news += len(news_list)
         ai_content = generate_ai_analysis(news_list, category)
         main_content += f"## {category}\n\n{ai_content}\n\n---\n\n"
+
+    # 自然科学板块：使用 RSS
+    print(f"\n📡 抓取 🔬 自然科学（目标 1-3 条）...")
+    nature_news = fetch_nature_science_news(max_count=3)
+    total_news += len(nature_news)
+    nature_content = generate_ai_analysis(nature_news, "🔬 自然科学")
+    main_content += f"## 🔬 自然科学\n\n{nature_content}\n\n---\n\n"
 
     card = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True, "enable_forward": True},
             "header": {
-                "title": {"tag": "plain_text", "content": f"🌅 {today_str} {weekday} · 科技前沿早报"},
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"🌅 {today_str} {weekday} · 科技前沿早报"
+                },
                 "template": "indigo"
             },
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": "**Timmy，早上好！** ☀️\n\n今日为你精选 **AI、计算机、数学、科研** 领域最新动态，配有深度解读与基础知识补充，助你跟上时代前沿！\n\n---"
+                    "content": (
+                        f"**Timmy，早上好！** ☀️\n\n"
+                        f"今日为你精选 **{total_news} 条**纯技术/理论前沿资讯，"
+                        f"涵盖 **AI与深度学习、计算机科学、数学与理论、自然科学** 四大板块，"
+                        f"均来自 arXiv、Nature、Science 等权威来源（近3天内），"
+                        f"配有深度解读与知识补充，已过滤政治/商业/人文内容。\n\n---"
+                    )
                 },
                 {"tag": "markdown", "content": main_content},
                 {"tag": "hr"},
                 {
                     "tag": "note",
-                    "elements": [{"tag": "plain_text", "content": "✨ 由 GitHub Actions + Manus AI 自动抓取并生成深度解读 | 每日 07:00 准时推送"}]
+                    "elements": [{
+                        "tag": "plain_text",
+                        "content": (
+                            "✨ 由 GitHub Actions + GPT-5.4 自动生成 | "
+                            "数据来源：arXiv API / Nature / Science / Phys.org | "
+                            "每日 07:00 准时推送 | 已过滤政治/商业/人文内容"
+                        )
+                    }]
                 }
             ]
         }
     }
 
-    print("🚀 正在发送到飞书...")
+    print("\n🚀 正在发送到飞书...")
     resp = requests.post(WEBHOOK_URL, json=card, timeout=15)
     resp.raise_for_status()
     result = resp.json()
