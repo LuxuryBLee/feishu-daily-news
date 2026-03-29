@@ -3,27 +3,24 @@
 适用于 GitHub Actions 定时触发，完全免费、永久独立运行
 
 数据源策略：
-  - arXiv API（非RSS）：支持按提交日期排序，周末也有数据
-  - Nature / Science / Phys.org RSS：自然科学板块
-  - Hacker News API：计算机工程实践
+  - arXiv API（5天内）
+  - Hacker News API（计算机与系统）
+  - IEEE Spectrum / MIT Tech Review（AI与计算机补充）
+  - Nature / Science / Phys.org RSS（自然科学板块）
 
-板块：
-  🤖 AI 与深度学习（至少3条）
-  💻 计算机科学与系统（至少3条）
-  📐 数学与理论（至少3条）
-  🔬 自然科学（1-3条）
-
-筛选原则：
-  - 纯技术/理论：论文发表、算法突破、理论证明、工程创新
-  - 过滤政治、人文、商业、娱乐等非技术内容
-  - 时间窗口：3天内
+策略：
+  - 时间窗口：5天内
+  - 每日去重：收集近5天数据后，使用当前日期作为随机种子进行采样，确保每天推送不同内容
+  - 纯技术/理论过滤：过滤政治、人文、商业、娱乐等
 """
 
 import os
 import re
 import time
+import random
 import requests
 import feedparser
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 import concurrent.futures
@@ -41,32 +38,31 @@ client = OpenAI(
     timeout=90.0
 )
 
-TIME_WINDOW_DAYS = 3
+TIME_WINDOW_DAYS = 5
 
-# ── arXiv 分类配置 ─────────────────────────────────────────────────────
+# ── 数据源配置 ─────────────────────────────────────────────────────────
 ARXIV_CATEGORIES = {
-    "🤖 AI与深度学习": [
-        "cs.AI", "cs.LG", "cs.CV", "cs.CL", "cs.NE", "stat.ML"
-    ],
-    "💻 计算机科学与系统": [
-        "cs.DS", "cs.CR", "cs.PL", "cs.DC", "cs.AR", "cs.SE", "cs.IT"
-    ],
-    "📐 数学与理论": [
-        "math.NA", "math.OC", "math.ST", "math.CO", "math.PR", "math.NT",
-        "math.AG", "math.AP", "cs.CC"
-    ],
+    "🤖 AI与深度学习": ["cs.AI", "cs.LG", "cs.CV", "cs.CL", "cs.NE", "stat.ML"],
+    "💻 计算机科学与系统": ["cs.DS", "cs.CR", "cs.PL", "cs.DC", "cs.AR", "cs.SE", "cs.IT"],
+    "📐 数学与理论": ["math.NA", "math.OC", "math.ST", "math.CO", "math.PR", "math.NT", "math.AG", "math.AP", "cs.CC"],
 }
 
-# 自然科学用 RSS（Nature/Science/Phys.org 不提供 API）
-NATURE_SCIENCE_RSS = [
-    {"url": "https://www.nature.com/nature.rss",            "name": "Nature"},
-    {"url": "https://www.science.org/rss/news_current.xml", "name": "Science"},
-    {"url": "https://phys.org/rss-feed/",                   "name": "Phys.org"},
-    {"url": "http://export.arxiv.org/rss/quant-ph",         "name": "arXiv · 量子物理"},
-    {"url": "http://export.arxiv.org/rss/physics.comp-ph",  "name": "arXiv · 计算物理"},
-]
+EXTRA_RSS_SOURCES = {
+    "🤖 AI与深度学习": [
+        "https://spectrum.ieee.org/feeds/feed.rss",
+        "https://www.technologyreview.com/feed/"
+    ],
+    "💻 计算机科学与系统": [
+        "https://dl.acm.org/action/showFeed?ui-place=journal&type=etoc&feed=rss&jc=jacm"
+    ],
+    "🔬 自然科学": [
+        "https://www.nature.com/nature.rss",
+        "https://www.science.org/rss/news_current.xml",
+        "https://phys.org/rss-feed/",
+        "http://export.arxiv.org/rss/quant-ph"
+    ]
+}
 
-# 板块条数限制
 CATEGORY_LIMITS = {
     "🤖 AI与深度学习":     {"min": 3, "max": 5},
     "💻 计算机科学与系统": {"min": 3, "max": 5},
@@ -113,133 +109,121 @@ def tech_score(title, summary=""):
     text = (title + " " + summary).lower()
     return sum(1 for kw in TECH_KEYWORDS if kw.lower() in text)
 
-# ── arXiv API 抓取 ─────────────────────────────────────────────────────
-def fetch_arxiv_group(categories, total_max=5):
-    """
-    通过 arXiv API 单次合并查询多个分类，避免并发限速。
-    使用 OR 连接多个分类，一次请求获取所有结果。
-    """
-    # 构建合并查询：cat:cs.AI OR cat:cs.LG OR ...
+# ── 抓取函数 ───────────────────────────────────────────────────────────
+def fetch_arxiv_api(categories):
     cat_query = " OR ".join(f"cat:{c}" for c in categories)
-    max_results = min(total_max * 6, 50)  # 多抓一些用于过滤
     url = (
         f"http://export.arxiv.org/api/query"
         f"?search_query={requests.utils.quote(cat_query)}"
         f"&sortBy=submittedDate&sortOrder=descending"
-        f"&max_results={max_results}"
+        f"&max_results=60"
     )
+    items = []
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         feed = feedparser.parse(resp.text)
-        all_items = []
         cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
         for entry in feed.entries:
             title = clean_html(entry.get('title', '')).replace('\n', ' ').strip()
             link = entry.get('link', '')
             summary = clean_html(entry.get('summary', ''))[:600]
-            # 时间过滤
             pub = entry.get('published', '')
             try:
                 dt = datetime.fromisoformat(pub.replace('Z', '+00:00'))
-                if dt < cutoff:
-                    continue
-            except Exception:
-                pass
-            if not title or len(title) < 5:
-                continue
-            if not is_technical_content(title, summary):
-                continue
-            all_items.append({
-                "title": title,
-                "link": link,
-                "summary": summary,
-                "score": tech_score(title, summary)
-            })
-
-        # 去重
-        seen, unique = set(), []
-        for item in all_items:
-            key = item["title"][:60].lower()
-            if key not in seen:
-                seen.add(key)
-                unique.append(item)
-
-        unique.sort(key=lambda x: x["score"], reverse=True)
-        result = unique[:total_max]
-        print(f"  共抓取 {len(feed.entries)} 条 → 过滤后 {len(all_items)} 条 → 去重 {len(unique)} 条 → 取前 {len(result)} 条")
-        return result
+                if dt < cutoff: continue
+            except: pass
+            if not title or not is_technical_content(title, summary): continue
+            items.append({"title": title, "link": link, "summary": summary, "score": tech_score(title, summary)})
     except Exception as e:
         print(f"  ⚠️ arXiv API 失败: {e}")
-        return []
+    return items
 
-# ── RSS 抓取（自然科学板块） ───────────────────────────────────────────
-def fetch_rss_sync(url, limit=8):
+def fetch_rss(url):
+    items = []
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
         feed = feedparser.parse(resp.text)
-        items = []
         cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
-        for entry in feed.entries[:limit]:
+        for entry in feed.entries[:20]:
             title = clean_html(entry.get('title', '')).strip()
             link = entry.get('link', '')
             summary = clean_html(entry.get('summary', entry.get('description', '')))[:600]
+            
             # 时间过滤
+            valid_time = False
             for field in ('published', 'updated'):
                 raw = entry.get(field, '')
                 if raw:
                     try:
                         dt = parsedate_to_datetime(raw)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        if dt < cutoff:
-                            title = ''  # 标记为过期
+                        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                        if dt >= cutoff: valid_time = True
                         break
-                    except Exception:
-                        continue
-            if not title or len(title) < 5:
-                continue
-            if not is_technical_content(title, summary):
-                continue
-            items.append({
-                "title": title,
-                "link": link,
-                "summary": summary,
-                "score": tech_score(title, summary)
-            })
-        return items
+                    except: continue
+            if not valid_time: continue
+            if not title or not is_technical_content(title, summary): continue
+            items.append({"title": title, "link": link, "summary": summary, "score": tech_score(title, summary)})
     except Exception as e:
         print(f"  ⚠️ RSS 失败 [{url}]: {e}")
-        return []
+    return items
 
-def fetch_nature_science_news(max_count=3):
-    """抓取自然科学板块"""
-    all_items = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(fetch_rss_sync, src["url"]) for src in NATURE_SCIENCE_RSS]
-        for future in concurrent.futures.as_completed(futures):
-            all_items.extend(future.result())
+def fetch_hacker_news():
+    items = []
+    try:
+        r = requests.get('https://hacker-news.firebaseio.com/v0/topstories.json', timeout=15)
+        story_ids = r.json()[:30]
+        cutoff = datetime.now(timezone.utc).timestamp() - TIME_WINDOW_DAYS * 86400
+        for sid in story_ids:
+            sr = requests.get(f'https://hacker-news.firebaseio.com/v0/item/{sid}.json', timeout=10).json()
+            if not sr or sr.get('type') != 'story' or sr.get('time', 0) < cutoff: continue
+            title = sr.get('title', '')
+            link = sr.get('url', f"https://news.ycombinator.com/item?id={sid}")
+            if not is_technical_content(title): continue
+            score = tech_score(title)
+            if score > 0: # HN需要包含技术关键词才算
+                items.append({"title": title, "link": link, "summary": "Hacker News Top Story", "score": score})
+    except Exception as e:
+        print(f"  ⚠️ HN 失败: {e}")
+    return items
 
+# ── 每日去重采样策略 ───────────────────────────────────────────────────
+def sample_daily_news(items, limit):
+    if not items: return []
+    # 1. 按标题去重
     seen, unique = set(), []
-    for item in all_items:
-        key = item["title"][:60].lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-
-    unique.sort(key=lambda x: x["score"], reverse=True)
-    result = unique[:max_count]
-    print(f"  共抓取 {len(all_items)} 条 → 去重后 {len(unique)} 条 → 取前 {len(result)} 条")
-    return result
+    for it in items:
+        k = it['title'][:50].lower()
+        if k not in seen:
+            seen.add(k)
+            unique.append(it)
+    
+    # 2. 筛选出技术得分最高的 Top N (比如 20条) 作为候选池
+    unique.sort(key=lambda x: x['score'], reverse=True)
+    pool = unique[:20]
+    
+    # 3. 使用当前日期作为随机种子，从候选池中随机抽取 limit 条
+    # 这样可以保证：
+    # a) 每天抽到的都不完全一样
+    # b) 抽到的都是近5天内高质量的技术内容
+    today_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y%m%d')
+    random.seed(today_str)
+    
+    sample_size = min(limit, len(pool))
+    sampled = random.sample(pool, sample_size)
+    
+    # 恢复按得分排序
+    sampled.sort(key=lambda x: x['score'], reverse=True)
+    return sampled
 
 # ── AI 解读 ────────────────────────────────────────────────────────────
 def generate_ai_analysis(news_list, category):
     if not news_list:
         return (
             f"> ⚠️ 今日{category}暂无符合条件的技术资讯\n"
-            f"> （时间窗口：近3天，已过滤非技术内容）\n"
+            f"> （时间窗口：近{TIME_WINDOW_DAYS}天，已过滤非技术内容）\n"
             f"> 明日继续关注！"
         )
 
@@ -252,7 +236,7 @@ def generate_ai_analysis(news_list, category):
 
     prompt = f"""你是一位资深的{category}专家和科普导师，读者是**信息与计算科学专业大学生**（对AI、深度学习、数学建模感兴趣，预计2027年毕业）。
 
-以下是{category}领域近3天内的最新论文/技术资讯（均为纯技术/理论内容，已过滤政治、商业、人文内容）：
+以下是{category}领域近{TIME_WINDOW_DAYS}天内的最新论文/技术资讯（均为纯技术/理论内容，已过滤政治、商业、人文内容）：
 
 {news_text}
 
@@ -316,21 +300,36 @@ def build_and_send():
     main_content = ""
     total_news = 0
 
-    # 三大重点板块：使用 arXiv API
-    for category, cats in ARXIV_CATEGORIES.items():
+    # 抓取各板块
+    for category in CATEGORY_LIMITS.keys():
         limits = CATEGORY_LIMITS[category]
-        print(f"\n📡 抓取 {category}（目标 {limits['min']}-{limits['max']} 条，分类：{cats}）...")
-        news_list = fetch_arxiv_group(cats, total_max=limits["max"])
+        print(f"\n📡 抓取 {category}（目标 {limits['min']}-{limits['max']} 条）...")
+        
+        all_items = []
+        
+        # arXiv
+        if category in ARXIV_CATEGORIES:
+            all_items.extend(fetch_arxiv_api(ARXIV_CATEGORIES[category]))
+            
+        # Hacker News (CS专用)
+        if category == "💻 计算机科学与系统":
+            all_items.extend(fetch_hacker_news())
+            
+        # RSS Sources
+        rss_urls = EXTRA_RSS_SOURCES.get(category, [])
+        if rss_urls:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(fetch_rss, url) for url in rss_urls]
+                for future in concurrent.futures.as_completed(futures):
+                    all_items.extend(future.result())
+        
+        # 每日随机采样去重
+        news_list = sample_daily_news(all_items, limit=limits["max"])
         total_news += len(news_list)
+        print(f"  ✅ 最终选中 {len(news_list)} 条用于推送")
+        
         ai_content = generate_ai_analysis(news_list, category)
         main_content += f"## {category}\n\n{ai_content}\n\n---\n\n"
-
-    # 自然科学板块：使用 RSS
-    print(f"\n📡 抓取 🔬 自然科学（目标 1-3 条）...")
-    nature_news = fetch_nature_science_news(max_count=3)
-    total_news += len(nature_news)
-    nature_content = generate_ai_analysis(nature_news, "🔬 自然科学")
-    main_content += f"## 🔬 自然科学\n\n{nature_content}\n\n---\n\n"
 
     card = {
         "msg_type": "interactive",
@@ -350,7 +349,7 @@ def build_and_send():
                         f"**Timmy，早上好！** ☀️\n\n"
                         f"今日为你精选 **{total_news} 条**纯技术/理论前沿资讯，"
                         f"涵盖 **AI与深度学习、计算机科学、数学与理论、自然科学** 四大板块，"
-                        f"均来自 arXiv、Nature、Science 等权威来源（近3天内），"
+                        f"均来自 arXiv、Nature、Science、IEEE、Hacker News 等权威来源（近{TIME_WINDOW_DAYS}天内），"
                         f"配有深度解读与知识补充，已过滤政治/商业/人文内容。\n\n---"
                     )
                 },
@@ -361,9 +360,9 @@ def build_and_send():
                     "elements": [{
                         "tag": "plain_text",
                         "content": (
-                            "✨ 由 GitHub Actions + GPT-5.4 自动生成 | "
-                            "数据来源：arXiv API / Nature / Science / Phys.org | "
-                            "每日 07:00 准时推送 | 已过滤政治/商业/人文内容"
+                            f"✨ 由 GitHub Actions + GPT-5.4 自动生成 | "
+                            f"数据池：近{TIME_WINDOW_DAYS}天 | 每日随机采样防重复 | "
+                            f"每日 07:00 准时推送"
                         )
                     }]
                 }
