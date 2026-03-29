@@ -33,7 +33,7 @@ WEBHOOK_URL = os.environ.get(
 
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     timeout=120.0
 )
 
