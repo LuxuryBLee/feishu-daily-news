@@ -33,7 +33,7 @@ WEBHOOK_URL = os.environ.get(
 
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url="https://ai.qaq.al/v1",
+    base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     timeout=120.0
 )
 
@@ -377,7 +377,7 @@ def generate_ai_analysis(news_list, category):
     try:
         print(f"  🤖 AI 解读 {category}（{len(news_list)} 条）...")
         response = client.chat.completions.create(
-            model="gpt-5.4",
+            model="qwen3-max",
             messages=[
                 {
                     "role": "system",
