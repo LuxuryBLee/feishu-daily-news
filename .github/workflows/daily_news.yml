@@ -21,7 +21,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安装依赖
-        run: pip install feedparser openai requests
+        run: pip install feedparser openai requests beautifulsoup4 lxml
 
       - name: 运行推送脚本
         env:
