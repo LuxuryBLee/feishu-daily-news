@@ -37,7 +37,7 @@ client = OpenAI(
     timeout=120.0
 )
 
-TIME_WINDOW_DAYS = 5
+TIME_WINDOW_DAYS = 7
 
 # ── 内容过滤 ───────────────────────────────────────────────────────────
 BLOCK_KEYWORDS = [
@@ -211,11 +211,26 @@ def fetch_arxiv_api(categories, max_results=50):
         "sortOrder": "descending",
         "max_results": max_results
     }
+    # 增加请求间隔，避免触发限速
+    time.sleep(2)
     try:
-        resp = safe_get(url, params=params, timeout=30)
+        # 使用随机 User-Agent
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        ]
+        headers = {"User-Agent": random.choice(user_agents)}
+        
+        resp = safe_get(url, headers=headers, params=params, timeout=30)
         if not resp:
+            print(f"  ⚠️ arXiv API 返回为空 ({cat_query[:30]}...)")
             return items
+            
         feed = feedparser.parse(resp.text)
+        if not feed.entries:
+            print(f"  ⚠️ arXiv API 解析结果为空 ({cat_query[:30]}...)")
+            
         cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
         for entry in feed.entries:
             title = clean_html(entry.get('title', '')).replace('\n', ' ').strip()
@@ -225,19 +240,30 @@ def fetch_arxiv_api(categories, max_results=50):
             if not pub:
                 continue
             try:
-                dt = datetime.fromisoformat(pub.replace('Z', '+00:00'))
+                # 兼容不同格式的日期
+                if 'Z' in pub:
+                    dt = datetime.fromisoformat(pub.replace('Z', '+00:00'))
+                else:
+                    dt = parsedate_to_datetime(pub)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                
                 if dt < cutoff:
                     continue
-            except:
+            except Exception as e:
+                # print(f"  DEBUG: 日期解析失败 {pub}: {e}")
                 continue
+                
             if not title or not is_technical_content(title, summary):
                 continue
+                
             items.append({
                 "title": title,
                 "link": link,
                 "summary": summary,
                 "score": tech_score(title, summary)
             })
+        print(f"  arXiv ({cat_query[:30]}...): 找到 {len(items)} 条符合条件的论文")
     except Exception as e:
         print(f"  ⚠️ arXiv API 失败: {e}")
     return items
@@ -538,7 +564,7 @@ def build_and_send():
                     "elements": [{
                         "tag": "plain_text",
                         "content": (
-                            f"✨ 由 GitHub Actions + GPT-5.4 自动生成 | "
+                            f"✨ 由 GitHub Actions + Qwen3-Max 自动生成 | "
                             f"数据池：近{TIME_WINDOW_DAYS}天 | 每日随机采样防重复 | "
                             f"每日 07:00 准时推送"
                         )
