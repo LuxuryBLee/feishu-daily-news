@@ -33,7 +33,7 @@ WEBHOOK_URL = os.environ.get(
 
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    base_url="https://api.deepseek.com",
     timeout=120.0
 )
 
@@ -407,7 +407,7 @@ def generate_ai_analysis(news_list, category):
     try:
         print(f"  🤖 AI 解读 {category}（{len(news_list)} 条）...")
         response = client.chat.completions.create(
-            model="qwen3-max",
+            model="deepseek-v4-pro",
             messages=[
                 {
                     "role": "system",
@@ -564,7 +564,7 @@ def build_and_send():
                     "elements": [{
                         "tag": "plain_text",
                         "content": (
-                            f"✨ 由 GitHub Actions + Qwen3-Max 自动生成 | "
+                            f"✨ 由 GitHub Actions + DeepSeek-V4 自动生成 | "
                             f"数据池：近{TIME_WINDOW_DAYS}天 | 每日随机采样防重复 | "
                             f"每日 07:00 准时推送"
                         )
