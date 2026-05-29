@@ -202,12 +202,14 @@ def fetch_semantic_scholar(query, limit=20, window_days=30):
             pub = p.get("publicationDate") or ""
             if not title or not url:
                 continue
-            if pub:
-                try:
-                    if datetime.fromisoformat(pub).replace(tzinfo=timezone.utc) < cutoff:
-                        continue
-                except Exception:
-                    pass
+            # 严格要求有近期发表日期：无日期或解析失败或过旧 → 剔除（保证“新鲜”）
+            if not pub:
+                continue
+            try:
+                if datetime.fromisoformat(pub).replace(tzinfo=timezone.utc) < cutoff:
+                    continue
+            except Exception:
+                continue
             items.append({"title": title, "link": url, "summary": abstract,
                           "source": "Semantic Scholar", "published": pub})
     except Exception as e:

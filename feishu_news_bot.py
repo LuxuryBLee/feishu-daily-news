@@ -62,6 +62,21 @@ BLOCK_KEYWORDS = [
     "娱乐", "明星", "电影", "体育",
     "lawsuit", "court ruling", "crime", "arrest", "scandal",
     "诉讼", "犯罪", "丑闻",
+    # 软性/生活/社会话题（自然科学板块易混入的泛科普）
+    "relationship", "dating", "marriage", "single beats", "self-help",
+    "lifestyle", "farm-business", "agri-start", "startup idea", "diet tips",
+    "恋爱", "婚姻", "单身", "创业点子",
+]
+
+# 自然科学板块的“正向相关性”关键词：命中才算合格，过滤掉社会/生活类软文
+SCIENCE_KEYWORDS = [
+    "quantum", "physics", "chemistry", "chemical", "biology", "biological",
+    "molecul", "gene", "genome", "protein", "cell", "neuron", "brain",
+    "material", "nano", "astro", "cosmo", "galaxy", "planet", "climate",
+    "particle", "atom", "photon", "electron", "catalyst", "enzyme", "dna",
+    "superconduct", "crystal", "fusion", "spectro", "evolution", "ecosystem",
+    "量子", "物理", "化学", "生物", "分子", "基因", "蛋白", "细胞", "材料",
+    "天文", "气候", "粒子", "催化",
 ]
 
 TECH_KEYWORDS = [
@@ -79,6 +94,12 @@ TECH_KEYWORDS = [
 def is_technical(title, summary=""):
     text = (title + " " + summary).lower()
     return not any(kw.lower() in text for kw in BLOCK_KEYWORDS)
+
+
+def is_science_relevant(item):
+    """自然科学板块专用：必须命中科学关键词，过滤社会/生活类软文。"""
+    text = (item.get("title", "") + " " + item.get("summary", "")).lower()
+    return any(kw.lower() in text for kw in SCIENCE_KEYWORDS)
 
 
 def tech_score(item):
@@ -213,6 +234,11 @@ def gather():
     for url in ["https://www.nature.com/nature.rss", "https://phys.org/rss-feed/"]:
         sci += sources.fetch_rss(url)
     sci += sources.fetch_semantic_scholar("quantum physics chemistry biology breakthrough", limit=10)
+    # 自然科学板块额外过滤：必须与科学主题相关，剔除社会/生活类软文
+    before = len(sci)
+    sci = [it for it in sci if is_science_relevant(it)]
+    if before != len(sci):
+        print(f"  🧪 科学相关性过滤：{before} → {len(sci)} 条")
 
     return {"AI与深度学习": ai, "计算机科学与系统": cs, "数学与理论": math_, "自然科学": sci}
 
