@@ -1,0 +1,15 @@
+# ── 每日早报机器人（GitHub Actions 运行）依赖 ──
+# 核心：抓取、解析、AI 解读、推送
+requests>=2.31.0
+feedparser>=6.0.11
+openai>=1.30.0          # 用于调用 DeepSeek（OpenAI 兼容接口）
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+pyyaml>=6.0
+
+# ── 知识库引擎（语义去重 / RAG 检索）──
+# numpy 用于向量余弦计算
+numpy>=1.26.0
+# fastembed 提供本地、免费、无需 API Key 的文本向量（基于 ONNX，无需 PyTorch）。
+# 它是“可选增强”：若安装/下载失败，知识库会自动降级为词法相似度，绝不影响早报推送。
+fastembed>=0.3.0

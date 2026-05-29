@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地调试产物
+dry_run_card.json
+
+# 本地密钥（务必不要提交）
+.env
+second_brain/.env
+
+# 模型/向量缓存
+.cache/
+*.onnx
