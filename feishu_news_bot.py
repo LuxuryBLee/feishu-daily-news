@@ -1,587 +1,333 @@
 """
-每日科技与科研前沿速递 - 飞书推送机器人
-适用于 GitHub Actions 定时触发，完全免费、永久独立运行
+每日科技与科研前沿速递 - 飞书推送机器人（升级版）
+适用于 GitHub Actions 定时触发，免费、独立运行。
 
-数据源策略（全部对 GitHub Actions IP 友好）：
-  - Semantic Scholar API（AI/CS/数学论文，无需注册，无IP限制）
-  - Papers With Code（AI/ML最新论文）
-  - arXiv HTTPS API（带重试和 User-Agent）
-  - Hacker News API（计算机与系统）
-  - Nature / Science / Phys.org RSS（自然科学板块）
+本次升级要点：
+  1. 数据源修复（实测 2026-05）：arXiv 改走未被限流的 RSS 通道当主力；Semantic Scholar 用 API Key
+     并全局限速 1 次/秒；移除已关停的 Papers With Code。彻底解决“板块空白”问题。
+  2. 知识库（第二大脑地基）：语义去重 + 历史档案(Markdown) + RAG 历史衔接（见 knowledge_base.py）。
+  3. 排版升级：飞书卡片 2.0，AI 解读折叠收纳（见 feishu_card.py）。
+  4. 更稳定：单源失败不影响整体；板块兜底防空白；异常/失败发告警卡片。
+  5. 解读更生动：重写提示词（继续使用 DeepSeek-V4-Pro）。
 
-策略：
-  - 时间窗口：5天内
-  - 每日去重：使用当前日期作为随机种子进行采样，确保每天推送不同内容
-  - 纯技术/理论过滤：过滤政治、人文、商业、娱乐等
+环境变量：
+  FEISHU_WEBHOOK   飞书自定义机器人 Webhook（必填）
+  OPENAI_API_KEY   DeepSeek API Key（用于解读）
+  S2_API_KEY       Semantic Scholar API Key（强烈建议配置，否则该源会被限流跳过）
+  DRY_RUN=1        只生成不发送（本地调试用）
 """
 
 import os
-import re
-import time
-import random
-import requests
-import feedparser
+import sys
+import json
+import traceback
 from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
+
+import requests
 from openai import OpenAI
+
+import sources
+import feishu_card
+from knowledge_base import KnowledgeBase
+
+try:
+    import feishu_sync  # 第二阶段：写入飞书多维表格（无密钥则自动跳过）
+except Exception:
+    feishu_sync = None
 
 # ── 配置 ──────────────────────────────────────────────────────────────
 WEBHOOK_URL = os.environ.get(
     "FEISHU_WEBHOOK",
-    "https://open.feishu.cn/open-apis/bot/v2/hook/26d07ddf-5139-444e-9ede-0fcc734a904f"
+    "https://open.feishu.cn/open-apis/bot/v2/hook/26d07ddf-5139-444e-9ede-0fcc734a904f",
 )
-
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url="https://api.deepseek.com",
-    timeout=120.0
-)
-
+DRY_RUN = os.environ.get("DRY_RUN") == "1" or "--dry-run" in sys.argv
 TIME_WINDOW_DAYS = 7
+MODEL = "deepseek-v4-pro"
 
-# ── 内容过滤 ───────────────────────────────────────────────────────────
+# 缺 OPENAI_API_KEY 时用占位符，避免构造即崩溃；真正调用失败会自动降级为原始要点。
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY") or "sk-missing",
+    base_url="https://api.deepseek.com",
+    timeout=120.0,
+)
+
+# ── 内容过滤与打分 ─────────────────────────────────────────────────────
 BLOCK_KEYWORDS = [
     "election", "president", "congress", "senate", "democrat", "republican",
-    "trump", "biden", "ukraine", "russia", "china policy", "geopolit",
+    "trump", "biden", "ukraine", "russia", "geopolit",
     "政治", "选举", "政府", "议会", "制裁", "外交", "战争", "军事",
-    "stock", "ipo", "funding", "valuation", "revenue", "profit", "acquisition",
-    "融资", "上市", "股价", "市值", "收购", "营收",
-    "celebrity", "movie", "music", "entertainment", "sports", "fashion",
-    "娱乐", "明星", "电影", "音乐", "体育",
-    "lawsuit", "court", "crime", "arrest", "scandal",
+    "stock", "ipo", "funding round", "valuation", "acquisition",
+    "融资", "上市", "股价", "市值", "收购",
+    "celebrity", "movie", "music album", "entertainment", "sports", "fashion",
+    "娱乐", "明星", "电影", "体育",
+    "lawsuit", "court ruling", "crime", "arrest", "scandal",
     "诉讼", "犯罪", "丑闻",
+    # 软性/生活/社会话题（自然科学板块易混入的泛科普）
+    "relationship", "dating", "marriage", "single beats", "self-help",
+    "lifestyle", "farm-business", "agri-start", "startup idea", "diet tips",
+    "恋爱", "婚姻", "单身", "创业点子",
+]
+
+# 自然科学板块的“正向相关性”关键词：命中才算合格，过滤掉社会/生活类软文
+SCIENCE_KEYWORDS = [
+    "quantum", "physics", "chemistry", "chemical", "biology", "biological",
+    "molecul", "gene", "genome", "protein", "cell", "neuron", "brain",
+    "material", "nano", "astro", "cosmo", "galaxy", "planet", "climate",
+    "particle", "atom", "photon", "electron", "catalyst", "enzyme", "dna",
+    "superconduct", "crystal", "fusion", "spectro", "evolution", "ecosystem",
+    "量子", "物理", "化学", "生物", "分子", "基因", "蛋白", "细胞", "材料",
+    "天文", "气候", "粒子", "催化",
 ]
 
 TECH_KEYWORDS = [
-    "algorithm", "model", "neural", "learning", "theorem", "proof",
-    "optimization", "complexity", "architecture", "framework", "benchmark",
-    "dataset", "training", "inference", "convergence", "gradient",
-    "transformer", "diffusion", "quantum", "cryptography", "graph",
-    "matrix", "tensor", "probability", "statistics", "topology",
-    "network", "computation", "logic", "formal", "verification",
-    "论文", "算法", "模型", "神经网络", "定理", "证明", "优化",
-    "复杂度", "架构", "基准", "训练", "推理", "收敛", "梯度",
-    "量子", "密码", "图论", "数论", "概率", "统计",
+    "algorithm", "model", "neural", "learning", "theorem", "proof", "transformer",
+    "optimization", "complexity", "architecture", "benchmark", "dataset",
+    "training", "inference", "convergence", "gradient", "diffusion", "quantum",
+    "cryptography", "graph", "matrix", "tensor", "probability", "statistics",
+    "topology", "computation", "logic", "verification", "reinforcement",
+    "embedding", "attention", "generative", "llm", "language model",
+    "论文", "算法", "模型", "神经网络", "定理", "证明", "优化", "复杂度",
+    "架构", "基准", "训练", "推理", "收敛", "量子", "密码", "图论", "概率",
 ]
 
-def clean_html(text):
-    if not text:
-        return ""
-    text = re.sub(r'<[^>]+>', '', text)
-    return re.sub(r'\s+', ' ', text).strip()
 
-def is_technical_content(title, summary=""):
+def is_technical(title, summary=""):
     text = (title + " " + summary).lower()
-    for kw in BLOCK_KEYWORDS:
-        if kw.lower() in text:
-            return False
-    return True
+    return not any(kw.lower() in text for kw in BLOCK_KEYWORDS)
 
-def tech_score(title, summary=""):
-    text = (title + " " + summary).lower()
-    return sum(1 for kw in TECH_KEYWORDS if kw.lower() in text)
 
-def safe_get(url, headers=None, params=None, timeout=25, retries=3):
-    """带重试的 HTTP GET"""
-    default_headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; DailyNewsBot/1.0; +https://github.com/LuxuryBLee/feishu-daily-news)"
-    }
-    if headers:
-        default_headers.update(headers)
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, headers=default_headers, params=params, timeout=timeout)
-            if resp.status_code == 429:
-                wait = 5 * (attempt + 1)
-                print(f"  ⏳ 限速，等待 {wait}s 后重试...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return resp
-        except Exception as e:
-            if attempt == retries - 1:
-                print(f"  ⚠️ 请求失败 [{url[:60]}]: {e}")
-                return None
-            time.sleep(3)
-    return None
+def is_science_relevant(item):
+    """自然科学板块专用：必须命中科学关键词，过滤社会/生活类软文。"""
+    text = (item.get("title", "") + " " + item.get("summary", "")).lower()
+    return any(kw.lower() in text for kw in SCIENCE_KEYWORDS)
 
-# ── 数据源：Semantic Scholar（最稳定，无IP限制）──────────────────────
-def fetch_semantic_scholar(query, fields="title,abstract,url,year,publicationDate", limit=20):
-    """使用 Semantic Scholar API 搜索论文"""
-    items = []
-    try:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
-        resp = safe_get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={
-                "query": query,
-                "fields": fields,
-                "limit": limit,
-                "sort": "publicationDate:desc"
-            },
-            timeout=30
-        )
-        if not resp:
-            return items
-        data = resp.json()
-        for paper in data.get("data", []):
-            title = paper.get("title", "").strip()
-            abstract = (paper.get("abstract") or "")[:600]
-            url = paper.get("url", "")
-            pub_date = paper.get("publicationDate", "")
-            
-            if not title or not url:
-                continue
-            
-            # 时间过滤（严格）
-            if not pub_date:
-                continue
-            try:
-                dt = datetime.fromisoformat(pub_date).replace(tzinfo=timezone.utc)
-                if dt < cutoff:
-                    continue
-            except:
-                continue
-            
-            if not is_technical_content(title, abstract):
-                continue
-            
-            items.append({
-                "title": title,
-                "link": url,
-                "summary": abstract,
-                "score": tech_score(title, abstract)
-            })
-    except Exception as e:
-        print(f"  ⚠️ Semantic Scholar 失败: {e}")
-    return items
 
-# ── 数据源：Papers With Code（AI/ML专用）────────────────────────────
-def fetch_papers_with_code(limit=20):
-    """从 Papers With Code 获取最新 AI/ML 论文"""
-    items = []
-    try:
-        resp = safe_get(
-            "https://paperswithcode.com/api/v1/papers/",
-            params={"ordering": "-published", "items_per_page": limit},
-            timeout=25
-        )
-        if not resp:
-            return items
-        data = resp.json()
-        cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
-        for paper in data.get("results", []):
-            title = paper.get("title", "").strip()
-            abstract = (paper.get("abstract") or "")[:600]
-            url = paper.get("url_pdf") or paper.get("url_abs") or ""
-            pub_date = paper.get("published", "")
-            
-            if not title:
-                continue
-            if not pub_date:
-                continue
-            try:
-                dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                if dt < cutoff:
-                    continue
-            except:
-                continue
-            if not is_technical_content(title, abstract):
-                continue
-            
-            items.append({
-                "title": title,
-                "link": f"https://paperswithcode.com/paper/{paper.get('id', '')}" if paper.get("id") else url,
-                "summary": abstract,
-                "score": tech_score(title, abstract)
-            })
-    except Exception as e:
-        print(f"  ⚠️ Papers With Code 失败: {e}")
-    return items
+def tech_score(item):
+    text = (item.get("title", "") + " " + item.get("summary", "")).lower()
+    score = sum(1 for kw in TECH_KEYWORDS if kw.lower() in text)
+    # arXiv 一手论文优先；HN 高热度加成
+    if item.get("source") == "arXiv":
+        score += 2
+    if item.get("hn_score"):
+        score += min(item["hn_score"] // 100, 3)
+    return score
 
-# ── 数据源：arXiv API（带重试）──────────────────────────────────────
-def fetch_arxiv_api(categories, max_results=50):
-    """使用 arXiv API 获取论文，带重试机制"""
-    items = []
-    cat_query = " OR ".join(f"cat:{c}" for c in categories)
-    url = "https://export.arxiv.org/api/query"
-    params = {
-        "search_query": cat_query,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-        "max_results": max_results
-    }
-    # 增加请求间隔，避免触发限速
-    time.sleep(2)
-    try:
-        # 使用随机 User-Agent
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        ]
-        headers = {"User-Agent": random.choice(user_agents)}
-        
-        resp = safe_get(url, headers=headers, params=params, timeout=30)
-        if not resp:
-            print(f"  ⚠️ arXiv API 返回为空 ({cat_query[:30]}...)")
-            return items
-            
-        feed = feedparser.parse(resp.text)
-        if not feed.entries:
-            print(f"  ⚠️ arXiv API 解析结果为空 ({cat_query[:30]}...)")
-            
-        cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
-        for entry in feed.entries:
-            title = clean_html(entry.get('title', '')).replace('\n', ' ').strip()
-            link = entry.get('link', '')
-            summary = clean_html(entry.get('summary', ''))[:600]
-            pub = entry.get('published', '')
-            if not pub:
-                continue
-            try:
-                # 兼容不同格式的日期
-                if 'Z' in pub:
-                    dt = datetime.fromisoformat(pub.replace('Z', '+00:00'))
-                else:
-                    dt = parsedate_to_datetime(pub)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                
-                if dt < cutoff:
-                    continue
-            except Exception as e:
-                # print(f"  DEBUG: 日期解析失败 {pub}: {e}")
-                continue
-                
-            if not title or not is_technical_content(title, summary):
-                continue
-                
-            items.append({
-                "title": title,
-                "link": link,
-                "summary": summary,
-                "score": tech_score(title, summary)
-            })
-        print(f"  arXiv ({cat_query[:30]}...): 找到 {len(items)} 条符合条件的论文")
-    except Exception as e:
-        print(f"  ⚠️ arXiv API 失败: {e}")
-    return items
 
-# ── 数据源：Hacker News（CS/系统）───────────────────────────────────
-def fetch_hacker_news():
-    items = []
-    try:
-        r = safe_get('https://hacker-news.firebaseio.com/v0/topstories.json', timeout=15)
-        if not r:
-            return items
-        story_ids = r.json()[:40]
-        cutoff_ts = datetime.now(timezone.utc).timestamp() - TIME_WINDOW_DAYS * 86400
-        for sid in story_ids[:25]:
-            sr = safe_get(f'https://hacker-news.firebaseio.com/v0/item/{sid}.json', timeout=10)
-            if not sr:
-                continue
-            data = sr.json()
-            if not data or data.get('type') != 'story' or data.get('time', 0) < cutoff_ts:
-                continue
-            title = data.get('title', '')
-            link = data.get('url', f"https://news.ycombinator.com/item?id={sid}")
-            if not is_technical_content(title):
-                continue
-            score = tech_score(title)
-            if score > 0:
-                items.append({
-                    "title": title,
-                    "link": link,
-                    "summary": "Hacker News Top Story",
-                    "score": score + data.get('score', 0) // 100
-                })
-    except Exception as e:
-        print(f"  ⚠️ HN 失败: {e}")
-    return items
+def prepare(items):
+    """过滤非技术内容并打分。"""
+    out = []
+    for it in items:
+        if not it.get("title") or not it.get("link"):
+            continue
+        if not is_technical(it.get("title", ""), it.get("summary", "")):
+            continue
+        it["score"] = tech_score(it)
+        out.append(it)
+    return out
 
-# ── 数据源：RSS（自然科学板块）──────────────────────────────────────
-def fetch_rss(url):
-    items = []
-    try:
-        resp = safe_get(url, timeout=20)
-        if not resp:
-            return items
-        feed = feedparser.parse(resp.text)
-        cutoff = datetime.now(timezone.utc) - timedelta(days=TIME_WINDOW_DAYS)
-        for entry in feed.entries[:20]:
-            title = clean_html(entry.get('title', '')).strip()
-            link = entry.get('link', '')
-            summary = clean_html(entry.get('summary', entry.get('description', '')))[:600]
-            valid_time = False
-            for field in ('published', 'updated'):
-                raw = entry.get(field, '')
-                if raw:
-                    try:
-                        dt = parsedate_to_datetime(raw)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        if dt >= cutoff:
-                            valid_time = True
-                        break
-                    except:
-                        continue
-            if not valid_time:
-                continue
-            if not title or not is_technical_content(title, summary):
-                continue
-            items.append({
-                "title": title,
-                "link": link,
-                "summary": summary,
-                "score": tech_score(title, summary)
-            })
-    except Exception as e:
-        print(f"  ⚠️ RSS 失败 [{url[:50]}]: {e}")
-    return items
 
-# ── 每日去重采样策略 ───────────────────────────────────────────────────
-def sample_daily_news(items, limit):
+def select(items, limit, kb, category):
+    """去重 + 选优 + 兜底（绝不返回空，除非真的一条都没抓到）。"""
     if not items:
         return []
-    seen, unique = set(), []
-    for it in items:
-        k = it['title'][:50].lower()
-        if k not in seen:
-            seen.add(k)
-            unique.append(it)
-    unique.sort(key=lambda x: x['score'], reverse=True)
-    pool = unique[:30]
-    today_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y%m%d')
-    random.seed(today_str)
-    sample_size = min(limit, len(pool))
-    sampled = random.sample(pool, sample_size)
-    sampled.sort(key=lambda x: x['score'], reverse=True)
-    return sampled
+    items = prepare(items)
+    if not items:
+        return []
+    # 语义去重（对比历史与彼此）
+    deduped = kb.filter_new(items, category)
+    pool = deduped if deduped else items  # 兜底：若全被判重，宁可少量重复也不空版
+    pool.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return pool[:limit]
+
 
 # ── AI 解读 ────────────────────────────────────────────────────────────
-def generate_ai_analysis(news_list, category):
+def generate_ai_analysis(news_list, category, related=None):
     if not news_list:
-        return (
-            f"> ⚠️ 今日{category}暂无符合条件的技术资讯\n"
-            f"> （时间窗口：近{TIME_WINDOW_DAYS}天，已过滤非技术内容）\n"
-            f"> 明日继续关注！"
-        )
+        return None
 
     news_text = "".join(
-        f"[{i+1}] 标题: {item['title']}\n"
-        f"摘要: {item['summary']}\n"
-        f"链接: {item['link']}\n\n"
-        for i, item in enumerate(news_list)
+        f"[{i+1}] 标题：{it['title']}\n摘要：{it.get('summary','(无摘要)')}\n链接：{it['link']}\n\n"
+        for i, it in enumerate(news_list)
     )
 
-    prompt = f"""你是一位资深的{category}专家和科普导师，读者是**信息与计算科学专业大学生**（对AI、深度学习、数学建模感兴趣，预计2027年毕业）。
+    related_block = ""
+    if related:
+        rel = "\n".join(f"- {r['title']}（{r['date']}）" for r in related)
+        related_block = (
+            f"\n【读者近期看过的相关内容】（可在解读中自然衔接，如“这延续了你之前关注的…”）：\n{rel}\n"
+        )
 
-以下是{category}领域近{TIME_WINDOW_DAYS}天内的最新论文/技术资讯（均为纯技术/理论内容）：
+    prompt = f"""你是一位风趣又严谨的{category}领域科普导师，读者是一名**信息与计算科学专业的大学生**（热爱 AI、深度学习、数学建模，2027 年毕业）。
+{related_block}
+以下是{category}近期的最新论文/技术资讯：
 
 {news_text}
 
-请对**每一条**内容进行详细解读，严格按以下格式输出，不得省略任何一条：
+请对**每一条**进行解读，严格按以下格式，不得省略任何一条：
 
 ---
 
 📌 **[完整标题](链接)**
 
-💡 **核心贡献**
-（2-3句话：该论文/技术的核心创新点、解决了什么问题、有何突破性意义）
+💡 **一句话看懂**
+（用一个生动的比喻或贴近生活的例子，让外行也能秒懂这项工作在做什么）
+
+🔬 **核心贡献**
+（2-3 句：创新点是什么、解决了什么真实痛点、为什么算突破）
 
 🧠 **知识补充**
-（通俗解释其中1-2个核心专业概念或数学原理，用类比或具体例子帮助大学生理解，100-150字）
+（挑 1-2 个核心专业概念/数学原理，用类比讲透，100-150 字，让大学生“学到东西”）
 
-📊 **与你的关联**
-（一句话：与信息与计算科学/AI/数学建模的关联，或对未来学习/研究的启发）
+🎯 **与你的关联**
+（一句话：与信息与计算科学/AI/数学建模学习或未来研究的关联与启发）
 
 ---
 
-**严格要求：**
-1. 全程使用中文，英文术语保留原文并加粗。
-2. 只基于提供的摘要进行合理推断，不捏造数据或结论。
-3. 重点突出**技术细节**和**数学原理**，不涉及任何政治、商业评论。
-4. 排版整洁，Markdown 加粗关键术语。"""
+**要求：**
+1. 中文为主，英文术语保留原文并**加粗**。
+2. 只基于摘要合理推断，不编造数据或结论。
+3. 生动、有画面感、有“原来如此”的感觉，但不失专业与准确。
+4. 排版整洁，关键术语用 Markdown 加粗。"""
 
     try:
-        print(f"  🤖 AI 解读 {category}（{len(news_list)} 条）...")
-        response = client.chat.completions.create(
-            model="deepseek-v4-pro",
+        print(f"  🤖 AI 解读 {category}（{len(news_list)} 条）…")
+        resp = client.chat.completions.create(
+            model=MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "你是专业的技术前沿解读助手，专注于AI、计算机科学、数学领域的学术论文和技术突破解读，"
-                        "只讨论纯技术和理论内容，不涉及政治、商业、人文话题。"
-                    )
-                },
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": (
+                    "你是专业又生动的技术前沿解读助手，专注 AI、计算机科学、数学领域的论文与技术突破，"
+                    "善用类比把复杂概念讲得通俗易懂，只讨论纯技术与理论内容。")},
+                {"role": "user", "content": prompt},
             ],
-            max_tokens=3000,
-            temperature=0.6
+            max_tokens=3200,
+            temperature=0.7,
         )
-        return response.choices[0].message.content
+        return resp.choices[0].message.content
     except Exception as e:
-        print(f"  ❌ AI解析失败 ({category}): {e}")
-        fallback = f"⚠️ AI 解读生成失败（{e}），原始资讯如下：\n\n"
-        fallback += "\n\n".join(
-            f"📌 **[{item['title']}]({item['link']})**\n> {item['summary'][:200]}..."
-            for item in news_list
+        print(f"  ❌ AI 解读失败（{category}）：{e}")
+        # 降级：直接给原始要点，保证有内容
+        return "\n\n".join(
+            f"📌 **[{it['title']}]({it['link']})**\n> {it.get('summary','')[:200]}…"
+            for it in news_list
         )
-        return fallback
 
-# ── 构建并发送飞书消息 ─────────────────────────────────────────────────
+
+# ── 抓取各板块 ─────────────────────────────────────────────────────────
+def gather():
+    print("\n📡 抓取各板块数据…\n")
+
+    print("🤖 [AI与深度学习]")
+    ai = sources.fetch_arxiv_rss(["cs.AI", "cs.LG", "cs.CL", "cs.CV", "cs.NE", "stat.ML"])
+    ai += sources.fetch_semantic_scholar("large language model deep learning neural network", limit=20)
+
+    print("💻 [计算机科学与系统]")
+    cs = sources.fetch_arxiv_rss(["cs.DS", "cs.CR", "cs.PL", "cs.DC", "cs.AR", "cs.SE", "cs.IT", "cs.OS"])
+    cs += sources.fetch_hacker_news()
+    cs += sources.fetch_semantic_scholar("distributed systems security cryptography compiler", limit=15)
+
+    print("📐 [数学与理论]")
+    math_ = sources.fetch_arxiv_rss(["math.OC", "math.NA", "math.ST", "math.CO", "math.PR", "math.NT", "math.AG", "cs.CC"])
+    math_ += sources.fetch_semantic_scholar("optimization theorem combinatorics number theory", limit=12)
+
+    print("🔬 [自然科学]")
+    sci = []
+    for url in ["https://www.nature.com/nature.rss", "https://phys.org/rss-feed/"]:
+        sci += sources.fetch_rss(url)
+    sci += sources.fetch_semantic_scholar("quantum physics chemistry biology breakthrough", limit=10)
+    # 自然科学板块额外过滤：必须与科学主题相关，剔除社会/生活类软文
+    before = len(sci)
+    sci = [it for it in sci if is_science_relevant(it)]
+    if before != len(sci):
+        print(f"  🧪 科学相关性过滤：{before} → {len(sci)} 条")
+
+    return {"AI与深度学习": ai, "计算机科学与系统": cs, "数学与理论": math_, "自然科学": sci}
+
+
+# ── 发送 ───────────────────────────────────────────────────────────────
+def send(payload):
+    if DRY_RUN:
+        with open("dry_run_card.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print("🧪 DRY_RUN：卡片已写入 dry_run_card.json，未发送。")
+        return True
+    try:
+        resp = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("StatusCode") == 0 or result.get("code") == 0:
+            print("✅ 飞书消息发送成功！")
+            return True
+        print(f"⚠️ 飞书返回异常：{result}")
+        return False
+    except Exception as e:
+        print(f"❌ 发送失败：{e}")
+        return False
+
+
+# ── 主流程 ─────────────────────────────────────────────────────────────
 def build_and_send():
-    now_utc8 = datetime.now(timezone.utc) + timedelta(hours=8)
-    today_str = now_utc8.strftime("%Y年%m月%d日")
-    weekday_map = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    weekday = weekday_map[now_utc8.weekday()]
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    date_cn = now.strftime("%Y年%m月%d日")
+    weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
+    date_iso = now.strftime("%Y-%m-%d")
 
-    # ── 各板块数据抓取策略 ────────────────────────────────────────────
-    print("\n📡 开始抓取各板块数据...\n")
+    kb = KnowledgeBase()
+    limits = {"AI与深度学习": 5, "计算机科学与系统": 5, "数学与理论": 4, "自然科学": 3}
 
-    # 板块1：AI与深度学习
-    print("🤖 [AI与深度学习] 抓取中...")
-    ai_items = []
-    # Semantic Scholar（最稳定）
-    ai_items.extend(fetch_semantic_scholar(
-        "deep learning neural network transformer reinforcement learning large language model",
-        limit=25
-    ))
-    print(f"  Semantic Scholar: {len(ai_items)} 条")
-    # Papers With Code
-    pwc = fetch_papers_with_code(limit=20)
-    ai_items.extend(pwc)
-    print(f"  Papers With Code: {len(pwc)} 条")
-    # arXiv 备用
-    arxiv_ai = fetch_arxiv_api(["cs.AI", "cs.LG", "cs.CV", "cs.CL", "cs.NE", "stat.ML"], max_results=40)
-    ai_items.extend(arxiv_ai)
-    print(f"  arXiv: {len(arxiv_ai)} 条")
-    ai_news = sample_daily_news(ai_items, limit=5)
-    print(f"  ✅ 最终选中 {len(ai_news)} 条\n")
+    raw = gather()
+    categories_data, analyses = [], {}
+    print("\n🧠 去重选优 + AI 解读…\n")
+    for name in ["AI与深度学习", "计算机科学与系统", "数学与理论", "自然科学"]:
+        selected = select(raw.get(name, []), limits[name], kb, name)
+        print(f"  ✅ {name}：选中 {len(selected)} 条")
+        related = kb.related(selected) if selected else []
+        analyses[name] = generate_ai_analysis(selected, name, related)
+        categories_data.append((name, selected))
 
-    # 板块2：计算机科学与系统
-    print("💻 [计算机科学与系统] 抓取中...")
-    cs_items = []
-    cs_items.extend(fetch_semantic_scholar(
-        "computer systems distributed computing security cryptography programming language compiler",
-        limit=20
-    ))
-    print(f"  Semantic Scholar: {len(cs_items)} 条")
-    hn = fetch_hacker_news()
-    cs_items.extend(hn)
-    print(f"  Hacker News: {len(hn)} 条")
-    arxiv_cs = fetch_arxiv_api(["cs.DS", "cs.CR", "cs.PL", "cs.DC", "cs.AR", "cs.SE", "cs.IT"], max_results=40)
-    cs_items.extend(arxiv_cs)
-    print(f"  arXiv: {len(arxiv_cs)} 条")
-    cs_news = sample_daily_news(cs_items, limit=5)
-    print(f"  ✅ 最终选中 {len(cs_news)} 条\n")
+    total = sum(len(items) for _, items in categories_data)
+    kb_total = kb.stats().get("total_entries", 0)
 
-    # 板块3：数学与理论
-    print("📐 [数学与理论] 抓取中...")
-    math_items = []
-    math_items.extend(fetch_semantic_scholar(
-        "mathematical theorem proof optimization combinatorics number theory topology algebra analysis",
-        limit=20
-    ))
-    print(f"  Semantic Scholar: {len(math_items)} 条")
-    math_items.extend(fetch_semantic_scholar(
-        "computational complexity algorithm graph theory probability statistics",
-        limit=15
-    ))
-    arxiv_math = fetch_arxiv_api(
-        ["math.NA", "math.OC", "math.ST", "math.CO", "math.PR", "math.NT", "math.AG", "math.AP", "cs.CC"],
-        max_results=40
-    )
-    math_items.extend(arxiv_math)
-    print(f"  arXiv: {len(arxiv_math)} 条")
-    math_news = sample_daily_news(math_items, limit=5)
-    print(f"  ✅ 最终选中 {len(math_news)} 条\n")
+    # 全空 → 告警
+    if total == 0:
+        send(feishu_card.build_alert_card(
+            "今日早报抓取为空",
+            "所有数据源今日均未返回可用内容，请检查 arXiv RSS / Semantic Scholar Key / 网络。"))
+        kb.close()
+        return
 
-    # 板块4：自然科学
-    print("🔬 [自然科学] 抓取中...")
-    sci_items = []
-    sci_rss = [
-        "https://www.nature.com/nature.rss",
-        "https://phys.org/rss-feed/",
-        "https://www.science.org/rss/news_current.xml",
-    ]
-    for rss_url in sci_rss:
-        fetched = fetch_rss(rss_url)
-        sci_items.extend(fetched)
-        print(f"  RSS [{rss_url[:40]}]: {len(fetched)} 条")
-    sci_items.extend(fetch_semantic_scholar(
-        "quantum physics chemistry biology breakthrough discovery",
-        limit=15
-    ))
-    sci_news = sample_daily_news(sci_items, limit=3)
-    print(f"  ✅ 最终选中 {len(sci_news)} 条\n")
+    card = feishu_card.build_card(date_cn, weekday, categories_data, analyses,
+                                  total, TIME_WINDOW_DAYS, kb_total)
+    ok = send(card)
 
-    # ── AI 解读 ───────────────────────────────────────────────────────
-    print("🤖 开始 AI 解读...\n")
-    categories_data = [
-        ("🤖 AI与深度学习", ai_news),
-        ("💻 计算机科学与系统", cs_news),
-        ("📐 数学与理论", math_news),
-        ("🔬 自然科学", sci_news),
-    ]
+    # 写入知识库（档案 + 索引）
+    try:
+        kb.write_markdown_archive(date_cn, weekday, categories_data, analyses)
+        for name, items in categories_data:
+            kb.add_entries(date_iso, name, items)
+        print(f"  📚 知识库累计沉淀 {kb.stats().get('total_entries', 0)} 条")
+    except Exception as e:
+        print(f"  ⚠️ 写入知识库失败：{e}")
 
-    main_content = ""
-    total_news = sum(len(d[1]) for d in categories_data)
+    # 第二阶段：同步到飞书多维表格（无密钥自动跳过）
+    if feishu_sync and not DRY_RUN:
+        try:
+            feishu_sync.sync_to_feishu(date_iso, categories_data)
+        except Exception as e:
+            print(f"  ℹ️ 飞书同步跳过/失败：{e}")
 
-    for category, news_list in categories_data:
-        ai_content = generate_ai_analysis(news_list, category)
-        main_content += f"## {category}\n\n{ai_content}\n\n---\n\n"
+    kb.close()
+    if not ok and not DRY_RUN:
+        send(feishu_card.build_alert_card("早报发送失败", "卡片发送返回异常，请检查 Webhook 配置。"))
 
-    # ── 构建飞书卡片 ──────────────────────────────────────────────────
-    card = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True, "enable_forward": True},
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": f"🌅 {today_str} {weekday} · 科技前沿早报"
-                },
-                "template": "indigo"
-            },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": (
-                        f"**Timmy，早上好！** ☀️\n\n"
-                        f"今日为你精选 **{total_news} 条**纯技术/理论前沿资讯，"
-                        f"涵盖 **AI与深度学习、计算机科学、数学与理论、自然科学** 四大板块，"
-                        f"来自 Semantic Scholar、Papers With Code、arXiv、Nature、Hacker News 等权威来源"
-                        f"（近{TIME_WINDOW_DAYS}天内），配有深度解读与知识补充。\n\n---"
-                    )
-                },
-                {"tag": "markdown", "content": main_content},
-                {"tag": "hr"},
-                {
-                    "tag": "note",
-                    "elements": [{
-                        "tag": "plain_text",
-                        "content": (
-                            f"✨ 由 GitHub Actions + DeepSeek-V4 自动生成 | "
-                            f"数据池：近{TIME_WINDOW_DAYS}天 | 每日随机采样防重复 | "
-                            f"每日 07:00 准时推送"
-                        )
-                    }]
-                }
-            ]
-        }
-    }
-
-    print("\n🚀 正在发送到飞书...")
-    resp = requests.post(WEBHOOK_URL, json=card, timeout=15)
-    resp.raise_for_status()
-    result = resp.json()
-    if result.get("StatusCode") == 0 or result.get("code") == 0:
-        print("✅ 飞书消息发送成功！")
-    else:
-        print(f"⚠️ 飞书返回: {result}")
 
 if __name__ == "__main__":
-    build_and_send()
+    try:
+        build_and_send()
+    except Exception:
+        err = traceback.format_exc()
+        print(err)
+        try:
+            send(feishu_card.build_alert_card("早报脚本异常", f"```\n{err[-800:]}\n```"))
+        except Exception:
+            pass
+        sys.exit(1)
