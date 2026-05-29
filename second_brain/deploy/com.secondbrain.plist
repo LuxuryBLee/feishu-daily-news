@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd 配置：让第二大脑开机自启、崩溃自动重启。
+
+  使用步骤（在 Mac mini 终端）：
+    1) 把下面两处 /Users/你的用户名/feishu-daily-news 改成你仓库的真实路径
+       （终端里 cd 到仓库后执行 pwd 可看到路径）
+    2) 默认启动“飞书”模式；想用网页版，把 run.sh 后的参数改成 web
+    3) 安装并启动：
+         cp second_brain/deploy/com.secondbrain.plist ~/Library/LaunchAgents/
+         launchctl load ~/Library/LaunchAgents/com.secondbrain.plist
+    4) 查看日志：tail -f /tmp/secondbrain.log
+    5) 停止：launchctl unload ~/Library/LaunchAgents/com.secondbrain.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.secondbrain</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/你的用户名/feishu-daily-news/second_brain/deploy/run.sh</string>
+        <string>feishu</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/你的用户名/feishu-daily-news</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/secondbrain.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/secondbrain.err.log</string>
+</dict>
+</plist>

@@ -11,8 +11,14 @@ feishu_card.py — 飞书卡片 2.0 排版
 注：经实测，飞书自定义机器人 Webhook 接受 schema 2.0 卡片；排版能力与 Webhook 无关。
 """
 
-# 飞书单条卡片有总大小限制，单个 markdown 元素内容过长会被截断或拒收，这里做安全上限
+import json
+
+# 飞书单条卡片有总大小限制（约 30KB）。这里做两道保险：
+#   1) 单条解读的字符上限；2) 整卡序列化后若仍超限，自动逐级压缩解读篇幅直至装得下。
 MAX_ANALYSIS_CHARS = 4500
+CARD_BYTE_LIMIT = 28000  # 留出安全余量（飞书上限约 30KB）
+# 逐级压缩时尝试的解读字符上限（越往后越短，0 表示丢弃解读只留要点列表）
+_SHRINK_STEPS = [4500, 3200, 2200, 1400, 800, 400, 0]
 
 CATEGORY_STYLE = {
     "AI与深度学习": {"emoji": "🤖", "color": "blue"},
@@ -28,8 +34,8 @@ def _truncate(text, limit):
     return text if len(text) <= limit else text[:limit] + "\n\n…（内容较长，已截断）"
 
 
-def _category_block(name, items, analysis):
-    """构建单个板块的卡片元素列表。"""
+def _category_block(name, items, analysis, analysis_cap=MAX_ANALYSIS_CHARS):
+    """构建单个板块的卡片元素列表。analysis_cap=0 时丢弃解读，仅保留要点列表。"""
     style = CATEGORY_STYLE.get(name, {"emoji": "•", "color": "grey"})
     elements = [{
         "tag": "markdown",
@@ -52,8 +58,8 @@ def _category_block(name, items, analysis):
         bullet_lines.append(f"**{i}.** [{it['title']}]({it['link']}){tag}")
     elements.append({"tag": "markdown", "content": "\n".join(bullet_lines)})
 
-    # AI 解读 → 折叠面板
-    if analysis:
+    # AI 解读 → 折叠面板（analysis_cap=0 时跳过，用于极端压缩兜底）
+    if analysis and analysis_cap > 0:
         elements.append({
             "tag": "collapsible_panel",
             "expanded": False,
@@ -64,18 +70,13 @@ def _category_block(name, items, analysis):
                 "icon": {"tag": "standard_icon", "token": "down-bold_outlined",
                           "color": "grey", "size": "16px 16px"},
             },
-            "elements": [{"tag": "markdown", "content": _truncate(analysis, MAX_ANALYSIS_CHARS)}],
+            "elements": [{"tag": "markdown", "content": _truncate(analysis, analysis_cap)}],
         })
     return elements
 
 
-def build_card(date_cn, weekday, categories_data, analyses, total_news,
-               window_days, kb_total=0, model_label="DeepSeek-V4-Pro"):
-    """构建完整的 Webhook 卡片消息。
-
-    categories_data: list[(name, items)]
-    analyses:        dict[name -> 解读文本]
-    """
+def _assemble(date_cn, weekday, categories_data, analyses, total_news,
+              window_days, kb_total, model_label, analysis_cap):
     body_elements = [{
         "tag": "markdown",
         "content": (
@@ -87,7 +88,7 @@ def build_card(date_cn, weekday, categories_data, analyses, total_news,
     }, {"tag": "hr"}]
 
     for name, items in categories_data:
-        body_elements.extend(_category_block(name, items, analyses.get(name)))
+        body_elements.extend(_category_block(name, items, analyses.get(name), analysis_cap))
         body_elements.append({"tag": "hr"})
 
     footer = f"✨ GitHub Actions + {model_label} 自动生成 · 每日 07:00 推送"
@@ -111,6 +112,25 @@ def build_card(date_cn, weekday, categories_data, analyses, total_news,
             "body": {"elements": body_elements},
         },
     }
+
+
+def build_card(date_cn, weekday, categories_data, analyses, total_news,
+               window_days, kb_total=0, model_label="DeepSeek-V4-Pro"):
+    """构建完整的 Webhook 卡片消息，并自动确保不超过飞书卡片大小上限。
+
+    categories_data: list[(name, items)]；analyses: dict[name -> 解读文本]
+    """
+    payload = None
+    for cap in _SHRINK_STEPS:
+        payload = _assemble(date_cn, weekday, categories_data, analyses, total_news,
+                            window_days, kb_total, model_label, cap)
+        size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        if size <= CARD_BYTE_LIMIT:
+            if cap < MAX_ANALYSIS_CHARS:
+                print(f"  📐 卡片较大，已压缩解读至 {cap} 字以适配飞书上限（{size} 字节）")
+            return payload
+    print(f"  ⚠️ 卡片仍偏大（已尽力压缩），按最小版发送。")
+    return payload
 
 
 def build_alert_card(title, detail):

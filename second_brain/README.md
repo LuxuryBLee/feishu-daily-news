@@ -44,12 +44,25 @@ GitHub 每日早报 ──每天产出──▶ knowledge_base/archive（每日�
    python3 second_brain/brain.py
    # 出现 "你> " 后随便问，比如：最近有什么关于扩散模型的论文？
    ```
-4. **接入飞书**（长连接，无需公网 IP）：
+4. **二选一启动**：
+   - **网页版（门槛最低，不用配飞书应用）**：
+     ```bash
+     python3 second_brain/webapp.py
+     # 浏览器打开终端提示的地址（默认 http://本机IP:7860），同局域网手机也能访问
+     ```
+   - **飞书版（长连接，无需公网 IP）**：
+     ```bash
+     python3 second_brain/feishu_bot.py
+     # 然后在飞书里给你的应用发消息试试
+     ```
+5. **开机自启 / 一直运行**（已为你写好配置，见 `second_brain/deploy/`）：
    ```bash
-   python3 second_brain/feishu_bot.py
-   # 然后在飞书里给你的应用发消息试试
+   # 一键启动（会先 git pull 拉最新档案再启动）：
+   ./second_brain/deploy/run.sh web      # 或 feishu
+   # 开机自启（崩溃自动重启）：编辑 com.secondbrain.plist 里的路径后
+   cp second_brain/deploy/com.secondbrain.plist ~/Library/LaunchAgents/
+   launchctl load ~/Library/LaunchAgents/com.secondbrain.plist
    ```
-5. **让它开机自启 / 一直运行**（可选，进阶）：用 macOS 的 `launchd` 或 `tmux`/`pm2` 守护进程。需要时告诉我，我给你写好配置。
 
 ## 让知识库保持最新
 
