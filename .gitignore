@@ -10,6 +10,8 @@ dry_run_card.json
 # 本地密钥（务必不要提交）
 .env
 second_brain/.env
+tools/.anythingllm.env
+tools/.anythingllm_synced.json
 
 # 模型/向量缓存
 .cache/
