@@ -94,10 +94,8 @@ def _assemble(date_cn, weekday, categories_data, analyses, total_news,
     footer = f"✨ GitHub Actions + {model_label} 自动生成 · 每日 07:00 推送"
     if kb_total:
         footer += f" · 知识库已沉淀 {kb_total} 条"
-    body_elements.append({
-        "tag": "note",
-        "elements": [{"tag": "plain_text", "content": footer}],
-    })
+    # 注意：卡片 schema 2.0 不支持 note 标签（实测 code 11246），用 markdown 作页脚
+    body_elements.append({"tag": "markdown", "content": f"<font color='grey'>{footer}</font>"})
 
     return {
         "msg_type": "interactive",
